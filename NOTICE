@@ -1,0 +1,13 @@
+Enfusion D3DMetal fix (dxgi.dll)
+Copyright 2026 Grigorii S. (BlenderRUS)
+https://github.com/BlenderRUS/enfusion-d3dmetal-fix
+
+Based on enfusion-dxgi-fix by vec715, licensed under the Apache License 2.0:
+https://github.com/vec715/enfusion-dxgi-fix
+
+Modifications (2026-10-14):
+  - Added src/input_layout_fix.inc: resolves D3D12_APPEND_ALIGNED_ELEMENT vertex input offsets
+    before pipeline creation, working around D3DMetal fetching vertex attributes from wrong
+    offsets (stretched geometry, noise textures in Arma Reforger).
+  - Logging to dxgi_hook.log is disabled unless ENF_LOG=1.
+  - Build switched to mingw-w64 (build.sh).

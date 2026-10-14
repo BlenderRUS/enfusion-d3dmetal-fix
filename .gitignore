@@ -1,0 +1,4 @@
+.DS_Store
+dist/
+/dxgi.dll
+/SHA256SUMS

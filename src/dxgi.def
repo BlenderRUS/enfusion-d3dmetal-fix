@@ -1,0 +1,5 @@
+LIBRARY dxgi
+EXPORTS
+    CreateDXGIFactory = Hook_CreateDXGIFactory
+    CreateDXGIFactory1 = Hook_CreateDXGIFactory1
+    CreateDXGIFactory2 = Hook_CreateDXGIFactory2
