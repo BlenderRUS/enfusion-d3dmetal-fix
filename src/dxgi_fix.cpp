@@ -65,6 +65,12 @@ static PFN_CREATE_DXGI_FACTORY g_realCreateDXGIFactory = nullptr;
 static PFN_CREATE_DXGI_FACTORY1 g_realCreateDXGIFactory1 = nullptr;
 static PFN_CREATE_DXGI_FACTORY2 g_realCreateDXGIFactory2 = nullptr;
 
+// Private IID: AdapterWrapper answers it with the wrapped (real) adapter. D3DMetal's
+// D3D12CreateDevice recognises its own adapters by vtable pointer and, if a foreign adapter
+// fails its private QueryInterface, reads the object as its own and crashes, so the wrapper
+// must be unwrapped before it reaches D3DMetal.
+static const GUID IID_EnfRealAdapter = {0x5f0c1a2e, 0x7b3d, 0x4e41, {0x9a, 0x6c, 0x2d, 0x81, 0xe4, 0x53, 0xb7, 0x10}};
+
 // ============================================================================
 // Fake IDXGIOutput Implementation
 // ============================================================================
@@ -568,7 +574,13 @@ public:
             AddRef();
             return S_OK;
         }
-        
+
+        if (riid == IID_EnfRealAdapter) {
+            m_realAdapter->AddRef();
+            *ppvObject = m_realAdapter;
+            return S_OK;
+        }
+
         // Forward unknown interfaces to real adapter
         return m_realAdapter->QueryInterface(riid, ppvObject);
     }

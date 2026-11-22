@@ -188,6 +188,42 @@ static void** CloneVtable(void** vtbl, size_t* slotsOut) {
     return mem + kPrefix;
 }
 
+// True if p lies inside the image of PE module `mod`.
+static bool InModuleImage(HMODULE mod, ULONG_PTR p) {
+    auto* base = (BYTE*)mod;
+    auto* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    return p >= (ULONG_PTR)base && p < (ULONG_PTR)base + nt->OptionalHeader.SizeOfImage;
+}
+
+// GPTK's PE d3d12.dll hands the game devices whose vtable is d3d12_trampoline_ptrs in its own
+// .data: one pointer per method to a per-slot 16-byte jump stub (d3d12_jump_table, also .data)
+// that jumps to D3DMetal. The device group comes first and each slot has its own stub, so the
+// table belongs to ID3D12Device alone. Entries point into the same module, which CloneVtable's
+// distance heuristic rejects. PE memory honours VirtualProtect, so patch the table in place; the
+// object's vptr stays unchanged, which keeps any vtable-identity checks in D3DMetal working.
+static bool PatchPeVtableInPlace(void** vt, DeviceVtable& d) {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)vt, &mod) || !mod)
+        return false;
+    size_t slots = 0;
+    while (slots < 4096 && InModuleImage(mod, (ULONG_PTR)vt[slots])) slots++;
+    if (slots <= kSlotCreateGraphicsPipelineState) return false;
+    size_t n = slots > kSlotCreatePipelineState ? kSlotCreatePipelineState + 1 : kSlotCreateGraphicsPipelineState + 1;
+    DWORD old = 0;
+    if (!VirtualProtect(vt, n * sizeof(void*), PAGE_READWRITE, &old)) return false;
+    d.orig = d.copy = vt;
+    d.slots = slots;
+    d.createGps = (PFN_CREATE_GPS)vt[kSlotCreateGraphicsPipelineState];
+    vt[kSlotCreateGraphicsPipelineState] = (void*)&Hook_CreateGraphicsPipelineState;
+    if (slots > kSlotCreatePipelineState) {
+        d.createPs = (PFN_CREATE_PS)vt[kSlotCreatePipelineState];
+        vt[kSlotCreatePipelineState] = (void*)&Hook_CreatePipelineState;
+    }
+    VirtualProtect(vt, n * sizeof(void*), old, &old);
+    return true;
+}
+
 static void HookDevice(void* device) {
     if (!device || !InputLayoutFixEnabled()) return;
     AcquireSRWLockExclusive(&g_devLock);
@@ -195,6 +231,10 @@ static void HookDevice(void* device) {
     const DeviceVtable* known = VtableFor(device);
     if (known) {
         if (vt != known->copy) *(void***)device = known->copy;
+    } else if (g_devVtableCount < (int)(sizeof(g_devVtables) / sizeof(g_devVtables[0])) &&
+               PatchPeVtableInPlace(vt, g_devVtables[g_devVtableCount])) {
+        const DeviceVtable& d = g_devVtables[g_devVtableCount++];
+        Log("[il] device %p hooked in place (PE vtable %p, %zu slots)", device, vt, d.slots);
     } else if (g_devVtableCount < (int)(sizeof(g_devVtables) / sizeof(g_devVtables[0]))) {
         size_t slots = 0;
         if (void** copy = CloneVtable(vt, &slots)) {
@@ -212,13 +252,29 @@ static void HookDevice(void* device) {
             Log("[il] device %p hooked (vtable %p, %zu slots copied)", device, vt, slots);
         } else {
             Log("[il] device %p: vtable %p not recognised, input layout fix inactive", device, vt);
+            HMODULE m = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt, &m);
+            Log("[il]   vtable module %p", m);
+            for (int i = -4; i < 64; i++) {
+                if (IsBadReadPtr(&vt[i], sizeof(void*))) { Log("[il]   vt[%d] unreadable", i); break; }
+                HMODULE em = nullptr;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[i], &em);
+                Log("[il]   vt[%d] = %p (module %p)", i, vt[i], em);
+            }
         }
     }
     ReleaseSRWLockExclusive(&g_devLock);
 }
 
 static HRESULT WINAPI Hook_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID riid, void** ppDevice) {
+    // Pass D3DMetal its own adapter, never our AdapterWrapper (see IID_EnfRealAdapter).
+    IUnknown* real = nullptr;
+    if (adapter && SUCCEEDED(adapter->QueryInterface(IID_EnfRealAdapter, (void**)&real)) && real) {
+        Log("[il] D3D12CreateDevice: unwrapped adapter %p -> %p", adapter, real);
+        adapter = real;
+    }
     HRESULT hr = g_realD3D12CreateDevice(adapter, level, riid, ppDevice);
+    if (real) real->Release();
     if (SUCCEEDED(hr) && ppDevice && *ppDevice) HookDevice(*ppDevice);
     return hr;
 }
@@ -228,7 +284,8 @@ static void InstallInputLayoutFix() {
     static bool done = false;
     if (done) return;
     done = true;
-    if (!InputLayoutFixEnabled()) return;
+    // Always installed: the adapter unwrap is needed even with ENF_INPUT_LAYOUT_FIX=0
+    // (HookDevice checks that flag itself).
     HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
     if (!d3d12) d3d12 = LoadLibraryA("d3d12.dll");
     if (d3d12) g_realD3D12CreateDevice = (PFN_D3D12_CREATE_DEVICE_RAW)GetProcAddress(d3d12, "D3D12CreateDevice");
